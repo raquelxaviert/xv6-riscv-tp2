@@ -26,6 +26,15 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+// Simple Linear Congruential Generator for random numbers
+static unsigned long randstate = 1;
+unsigned long
+random(void)
+{
+  randstate = randstate * 1664525 + 1013904223;
+  return randstate;
+}
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -146,6 +155,10 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // Initialize lottery scheduling fields
+  p->tickets = 1;
+  p->ticks = 0;
+
   return p;
 }
 
@@ -168,6 +181,8 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->tickets = 0;
+  p->ticks = 0;
   p->state = UNUSED;
 }
 
@@ -289,6 +304,9 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+
+  // Inherit tickets from parent
+  np->tickets = p->tickets;
 
   pid = np->pid;
 
@@ -438,23 +456,46 @@ scheduler(void)
     intr_off();
 
     int found = 0;
+    
+    // Lottery scheduling: count total tickets
+    int total_tickets = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+        total_tickets += p->tickets;
       }
       release(&p->lock);
     }
+    
+    if(total_tickets > 0) {
+      // Pick a random ticket
+      int winning_ticket = random() % total_tickets;
+      int ticket_counter = 0;
+      
+      // Find the winner
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          ticket_counter += p->tickets;
+          if(ticket_counter > winning_ticket) {
+            // Winner! Switch to this process
+            p->state = RUNNING;
+            c->proc = p;
+            p->ticks++;
+            swtch(&c->context, &p->context);
+
+            // Process is done running for now.
+            // It should have changed its p->state before coming back.
+            c->proc = 0;
+            found = 1;
+            release(&p->lock);
+            break;
+          }
+        }
+        release(&p->lock);
+      }
+    }
+    
     if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
